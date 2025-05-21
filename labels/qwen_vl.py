@@ -11,6 +11,10 @@ sys.path.append("..")
 from base_utils.util import *
 from prompt_hub import get_text_prompt,get_style_prompt,get_festvial_prompt, get_element_prompt
 from config import API_KEY, MODEL
+from util import retry, check_dicts_keys
+import json
+import asyncio
+import json_repair
 
 
 def save_base64_to_image(base64_string, output_path):
@@ -36,13 +40,42 @@ class VideoAnalysis:
 
         # self.reference_message = self.rec_with_reference()
 
-    def rec(self, input_path, mode):
-        file_name = os.path.basename(input_path)
-        # 区分视频还是图片
-        ext = file_name.split(".")[1]
-        prompt = ""
-        frames = None
+    def rec_all_in_one(self, input_path, mode = 1):
+        res = asyncio.run(self.arec_all_in_one(input_path, mode))
+        return res
 
+    async def arec_all_in_one(self, input_path, mode = 1):
+        frames, ext = self._deal_with_file(input_path)
+        # 文字类素材
+        if mode == 1:
+            text_label = await self.rec(frames, ext, mode)
+            return text_label
+        else:
+            # 风格打标
+            task_1 = self.rec(frames, ext, 2)
+            # 元素打标
+            task_2 = self.rec(frames, ext, 4)
+            # 判断是否有节日
+            task_3 = self.rec(frames, ext, 3)
+            style_label, element_label, festival_label = await asyncio.gather(
+                task_1, task_2, task_3
+            )
+            flag = self.check_if_festival(festival_label)
+
+            style_label = json.dumps(style_label, ensure_ascii=False)
+            element_label = json.dumps(element_label, ensure_ascii=False)
+            festival_label = json.dumps(festival_label, ensure_ascii=False)
+            if flag:
+                return "风格" + style_label + "\n" + "元素" + element_label + "\n" + "节日" + festival_label
+            else:
+                return "风格" + style_label + "\n" + "元素" + element_label + "\n"
+
+    async def rec(self, frames, ext, mode):
+        # file_name = os.path.basename(input_path)
+        # 区分视频还是图片
+        # ext = file_name.split(".")[1]
+        prompt = ""
+        # frames = self._deal_with_file(input_path)
         image_prompt = ""
         video_prompt = ""
         if mode == 1:
@@ -60,15 +93,15 @@ class VideoAnalysis:
 
         image_ext = "jpeg"
         if ext in ["jpg", "jpeg", "png"]:
-            frames = self._deal_image(input_path)
+            # frames = self._deal_image(input_path)
             prompt = image_prompt
             if ext == "png":
                 image_ext = ext
         elif ext in ["mp4", "mov", "MP4", "avi", "MOV"]:
-            frames = self._deal_video(input_path)
+            # frames = self._deal_video(input_path)
             prompt = video_prompt
         elif ext in ["webp", "WEBP"]:
-            frames = self._deal_webp(input_path)
+            # frames = self._deal_webp(input_path)
             # webp使用 中间一帧好了
             # count = len(frames)
             # frames = [frames[count // 2]]
@@ -76,12 +109,25 @@ class VideoAnalysis:
             # save_base64_to_image(frames[0], f"./{num_global}.jpg")
             # num_global += 1
             prompt = video_prompt
-        if len(frames) == 1:
+        if len(frames) < 4:
             prompt = image_prompt
-        res = self._scene_rec(prompt, frames, image_ext)
-        return res
+            frames = [frames[0]]
+        res = self._scene_rec(prompt, frames, image_ext, mode)
 
-    def _scene_rec(self, prompt, base64_images, image_ext, need_reference=False):
+        # 过滤掉置信度 <= 0.2 的标签
+        final_res = []
+        for item in res:
+            if item["置信度"] < 0.201:
+                continue
+            else:
+                final_res.append(item) 
+
+        print("*" * 50)
+        print(mode)
+        return final_res
+
+
+    def _scene_rec(self, prompt, base64_images, image_ext, mode, need_reference=False):
         video_url = []
         messages = []
         for base64_image in base64_images:
@@ -112,6 +158,19 @@ class VideoAnalysis:
         else:
             messages.append({"role": "user", "content": content})
 
+        # completion = self.__client.chat.completions.create(
+        #     model="qwen-vl-max-latest",
+        #     messages=messages
+        # )
+
+        # res = completion.choices[0].message.content
+        # print(completion.usage.total_tokens)
+        res = self.ask_vl_llm(messages, mode)
+
+        return res
+
+    @retry(retry_times=3)
+    def ask_vl_llm(self, messages, mode):
         completion = self.__client.chat.completions.create(
             model="qwen-vl-max-latest",
             messages=messages
@@ -120,7 +179,59 @@ class VideoAnalysis:
         res = completion.choices[0].message.content
         print(completion.usage.total_tokens)
 
-        return res
+        # # 解析数据
+        json_str = res.replace("```json", "").replace("```", "")
+        data = json_repair.repair_json(json_str, return_objects=True)
+        if isinstance(data, dict):
+            data = [data]
+        # data = json.loads(json_str)
+        # exact_fields = []
+        # if mode == 1:
+        #     exact_fields = ["颜色", "置信度"]
+        # else:
+        #     exact_fields = ["标签", "置信度"]
+        # flag = check_dicts_keys(data, exact_fields)
+        # if not flag:
+        #     print(mode)
+        #     print("*"* 50)
+        #     print(res)
+        #     raise ValueError("Invalid JSON format")
+
+        return data
+
+    def check_if_festival(self, data):
+        if data:
+            if isinstance(data, list):
+                for d in data:
+                    if d["标签"] == "无节日" and d["置信度"] > 0.8:
+                        return False
+            else:
+                if data["标签"] == "无节日" and data["置信度"] > 0.8:
+                    return False
+            return True
+        else:
+            return False
+    def _deal_with_file(self, input_path):
+        file_name = os.path.basename(input_path)
+        ext = file_name.split(".")[1]
+        image_ext = "jpeg"
+        frames = None
+        if ext in ["jpg", "jpeg", "png"]:
+            frames = self._deal_image(input_path)
+            if ext == "png":
+                image_ext = ext
+        elif ext in ["mp4", "mov", "MP4", "avi", "MOV"]:
+            frames = self._deal_video(input_path)
+        elif ext in ["webp", "WEBP"]:
+            frames = self._deal_webp(input_path)
+        
+        # 将base64编码的图片保存为图片
+        debug = 0
+        if debug:
+            for i, frame in enumerate(frames):
+                save_base64_to_image(frame, f"./labels/temp/{i}.png")
+
+        return frames, ext
 
     def _deal_webp(self, image_path):
         image = Image.open(image_path)
@@ -214,7 +325,7 @@ class VideoAnalysis:
     
 
 if __name__ == "__main__":
-    video = VideoAnalysis()
+    # video = VideoAnalysis()
     # test_dir = "/home/pan/Downloads/文字/"
     # log_file = open("./log_0327.txt", "w")
     # files = os.listdir(test_dir)
@@ -226,6 +337,34 @@ if __name__ == "__main__":
 
     # log_file.close()
 
-    test_path = "/home/pan/Downloads/文字/10.webp"
-    res = video.rec(test_path, 3)
-    print(res)
+    async def main():
+        video = VideoAnalysis()
+        dir_path = "/home/pan/Downloads/素材标签测试/"
+        sub_dir_paths = os.listdir(dir_path)
+        for sub_dir_path in sub_dir_paths:
+            files = os.listdir(os.path.join(dir_path, sub_dir_path))
+            log_file = open(os.path.join(dir_path, sub_dir_path, f"{sub_dir_path}.txt"), "w")
+            for file in files:
+                file_path = os.path.join(dir_path, sub_dir_path, file)
+                file_frames, ext = video._deal_with_file(file_path)
+                res_1 = await video.rec(file_frames, ext, 2)
+                res_2 = await video.rec(file_frames, ext, 4)
+                res_3 = await video.rec(file_frames, ext, 3)
+                log_file.write(f"{file}: \n")
+                log_file.write(f"风格：{res_1}: \n")
+                log_file.write(f"元素：{res_2}\n")
+                flag = video.check_if_festival(res_3)
+                if flag:
+                    log_file.write(f"节日：{res_3}\n")
+                log_file.write("\n")
+            log_file.close()
+              # print(f"{file}: {res}")
+
+    async def main2():
+        video = VideoAnalysis()
+        test_path = "/home/pan/Downloads/素材标签测试/贴纸/sticker (22).webp"
+        frames, ext = video._deal_with_file(test_path)
+        res = await video.rec(frames, ext, 3)
+        print(res)
+
+    asyncio.run(main2())
