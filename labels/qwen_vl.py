@@ -4,17 +4,21 @@ from PIL import Image
 import base64
 from io import BytesIO
 import sys
+from tqdm import tqdm
 
 print(os.getcwd())
-sys.path.append(".")
-sys.path.append("..")
+sys.path.append("/home/pan/Documents/2025/2025")
+# sys.path.append("..")
 from base_utils.util import *
-from prompt_hub import get_text_prompt,get_style_prompt,get_festvial_prompt, get_element_prompt
+from prompt.prompt_hub import get_text_prompt,get_style_prompt,get_festvial_prompt, get_element_prompt
+from prompt.prompt_theme import get_theme_prompt
+from prompt.prompt_transition import get_transition_prompt
 from config import API_KEY, MODEL
 from util import retry, check_dicts_keys
 import json
 import asyncio
 import json_repair
+from enum import Enum
 
 
 def save_base64_to_image(base64_string, output_path):
@@ -50,7 +54,7 @@ class VideoAnalysis:
         if mode == 1:
             text_label = await self.rec(frames, ext, mode)
             return text_label
-        else:
+        elif (1 < mode < 5):
             # 风格打标
             task_1 = self.rec(frames, ext, 2)
             # 元素打标
@@ -60,6 +64,7 @@ class VideoAnalysis:
             style_label, element_label, festival_label = await asyncio.gather(
                 task_1, task_2, task_3
             )
+
             flag = self.check_if_festival(festival_label)
 
             style_label = json.dumps(style_label, ensure_ascii=False)
@@ -69,6 +74,12 @@ class VideoAnalysis:
                 return "风格" + style_label + "\n" + "元素" + element_label + "\n" + "节日" + festival_label
             else:
                 return "风格" + style_label + "\n" + "元素" + element_label + "\n"
+        elif mode == 5:
+            theme_label = await self.rec(frames, ext, mode)
+            return theme_label
+        elif mode == 6:
+            transiton_label = await self.rec(frames, ext, mode)
+            return transiton_label
 
     async def rec(self, frames, ext, mode):
         # file_name = os.path.basename(input_path)
@@ -90,6 +101,12 @@ class VideoAnalysis:
         if mode == 4:
             image_prompt = get_element_prompt("图片")
             video_prompt = get_element_prompt("视频")
+        if mode == 5:
+            image_prompt = get_theme_prompt("图片")
+            video_prompt = get_theme_prompt("视频")
+        if mode == 6:
+            image_prompt = get_transition_prompt("图片")
+            video_prompt = get_transition_prompt("视频")
 
         image_ext = "jpeg"
         if ext in ["jpg", "jpeg", "png"]:
@@ -117,10 +134,14 @@ class VideoAnalysis:
         # 过滤掉置信度 <= 0.2 的标签
         final_res = []
         for item in res:
-            if item["置信度"] < 0.201:
+            try:
+                if item["置信度"] < 0.201:
+                    continue
+                else:
+                    final_res.append(item) 
+            except Exception as e:
+                final_res = res
                 continue
-            else:
-                final_res.append(item) 
 
         print("*" * 50)
         print(mode)
@@ -173,7 +194,8 @@ class VideoAnalysis:
     def ask_vl_llm(self, messages, mode):
         completion = self.__client.chat.completions.create(
             model="qwen-vl-max-latest",
-            messages=messages
+            messages=messages,
+            temperature=0.01
         )
 
         res = completion.choices[0].message.content
@@ -228,8 +250,12 @@ class VideoAnalysis:
         # 将base64编码的图片保存为图片
         debug = 0
         if debug:
+            files = os.listdir("/home/pan/Documents/2025/2025/labels/temp")
+            if len(files) > 0:
+                for file in files:
+                    os.remove(f"/home/pan/Documents/2025/2025/labels/temp/{file}")
             for i, frame in enumerate(frames):
-                save_base64_to_image(frame, f"./labels/temp/{i}.png")
+                save_base64_to_image(frame, f"/home/pan/Documents/2025/2025/labels/temp/{i}.png")
 
         return frames, ext
 
@@ -339,32 +365,35 @@ if __name__ == "__main__":
 
     async def main():
         video = VideoAnalysis()
-        dir_path = "/home/pan/Downloads/素材标签测试/"
+        dir_path = "/home/pan/Downloads/素材测试5.27/"
+
+        
         sub_dir_paths = os.listdir(dir_path)
         for sub_dir_path in sub_dir_paths:
+            if sub_dir_path != "主题":
+                continue
+            
+            rec_file_path = os.path.join(dir_path, sub_dir_path, f"{sub_dir_path}.txt")
+            if os.path.exists(rec_file_path):
+                os.remove(rec_file_path)
+            
             files = os.listdir(os.path.join(dir_path, sub_dir_path))
-            log_file = open(os.path.join(dir_path, sub_dir_path, f"{sub_dir_path}.txt"), "w")
-            for file in files:
+            log_file = open(rec_file_path, "w")
+            for file in tqdm(files, desc="处理进度", colour="#0000ff"):
                 file_path = os.path.join(dir_path, sub_dir_path, file)
                 file_frames, ext = video._deal_with_file(file_path)
-                res_1 = await video.rec(file_frames, ext, 2)
-                res_2 = await video.rec(file_frames, ext, 4)
-                res_3 = await video.rec(file_frames, ext, 3)
+                res_1 = await video.rec(file_frames, ext, 5)
                 log_file.write(f"{file}: \n")
-                log_file.write(f"风格：{res_1}: \n")
-                log_file.write(f"元素：{res_2}\n")
-                flag = video.check_if_festival(res_3)
-                if flag:
-                    log_file.write(f"节日：{res_3}\n")
+                log_file.write(f"主题：{res_1}: \n")
                 log_file.write("\n")
             log_file.close()
               # print(f"{file}: {res}")
 
     async def main2():
         video = VideoAnalysis()
-        test_path = "/home/pan/Downloads/素材标签测试/贴纸/sticker (22).webp"
+        test_path = "/home/pan/Downloads/素材测试5.27/特效/efx (14).webp"
         frames, ext = video._deal_with_file(test_path)
-        res = await video.rec(frames, ext, 3)
+        res = await video.rec(frames, ext, 6)
         print(res)
 
-    asyncio.run(main2())
+    asyncio.run(main())
